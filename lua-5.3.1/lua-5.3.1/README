@@ -1,0 +1,568 @@
+
+This is Lua 5.3.1, released on 10 Jun 2015.
+
+For installation instructions, license details, and
+further information about Lua, see doc/readme.html.
+
+Lua
+阅读笔记：
+
+========================================================================================
+// 关于lua堆栈地址转换
+index2addr：static TValue *index2addr (lua_State *L, int idx)  :idx 为 ci->func 以上的栈位移大小（绝对偏移）
+1：L->top,当前堆栈的第一个空闲slot, 假如为3 ， ci->func:当前调用链的函数堆栈位置，在参数区的前一个，这里标为 0，则 ci->top - (ci->func + 1) = 2（不包括0,即 1,2 为有效的参数区
+2: LUA_REGISTRYINDEX: 注册表地址，是一个很大的负数，如果idx为此值则返回全局state的注册表
+3：如果idx > LUA_REGISTRYINDEX && idx < 0, 则将其转换成正数，作为一个正常的堆栈偏移
+4：如果还在这个区段之外，则只可能是C闭包函数的上值，如果可以的话将其转换成c闭包函数的上值地址返回  【为什么不清楚】！
+
+
+
+
+
+
+
+
+
+=========================================================================================
+// 关于lua对象 普通数据类型，可回收数据类型，统一放在Value中保存，而每个stack slot实际上都是一个 TValue 结构，TValue包含了一个普通的gc头用于回收，详见：
+
+#define TValuefields  Value value_; int tt_
+
+struct lua_TValue {
+  TValuefields;
+};
+
+union Value {
+	GCObject *gc;    /* collectable objects */   //取了可回收结构的第一个结构体地址，地址是共享的！
+	void *p;         /* light userdata */   
+	int b;           /* booleans */
+	lua_CFunction f; /* light C functions */
+	lua_Integer i;   /* integer numbers */
+	lua_Number n;    /* float numbers */
+};
+
+Value是一个总的数据类型，所有类型无论是不是gc类型都能够用Value来表达，如果不是gc类型则可用值类型表示，否则用*gc指针来指向gc数据类型指针
+
+
+union GCUnion {
+  GCObject gc;  /* common header */
+  struct TString ts;   //字符串类型
+  struct Udata u;      //userdata类型
+  union Closure cl;    //绑定upvalue的函数（运行时）
+  struct Table h;      //表
+  struct Proto p;      //未绑定upvalue的函数（编译时）
+  struct lua_State th;  /* thread 线程*/
+};
+
+
+
+
+
+
+
+
+
+==========================================================================================
+// 关于table的组织方式
+
+typedef struct Table { 
+  CommonHeader;
+  lu_byte flags;  /* 1<<p means tagmethod(p) is not present */
+  lu_byte lsizenode;  /* log2 of size of 'node' array */
+  unsigned int sizearray;  /* size of 'array' array */  
+  TValue *array;  /* array part */ 数组，用于数字下表key
+  Node *node; //节点,用于字符串key
+  Node *lastfree;  /* any free position is before this position */
+  struct Table *metatable;
+  GCObject *gclist;
+} Table;
+
+包含下标和短字符key，分别存储在array和node结构中.
+关于如何获取一个table中对应key值的对象：
+
+const TValue *luaH_get (Table *t, const TValue *key) {
+  switch (ttype(key)) {
+    case LUA_TSHRSTR: return luaH_getstr(t, tsvalue(key)); //是字符串？
+    case LUA_TNUMINT: return luaH_getint(t, ivalue(key));  //是整形数字？
+    case LUA_TNIL: return luaO_nilobject;
+    case LUA_TNUMFLT: { //是浮点数？
+      lua_Integer k;
+      if (luaV_tointeger(key, &k, 0)) /* index is int? */
+        return luaH_getint(t, k);  /* use specialized version */
+      /* else... */
+    }  /* FALLTHROUGH */
+    default: { //其他数据类型，转换成指针，可能有冲突
+      Node *n = mainposition(t, key);
+      for (;;) {  /* check whether 'key' is somewhere in the chain */
+        if (luaV_rawequalobj(gkey(n), key))
+          return gval(n);  /* that's it */
+        else { 
+          int nx = gnext(n);
+          if (nx == 0) break;
+          n += nx;
+        }
+      };
+      return luaO_nilobject;
+    }
+  }
+}  
+
+数字类型的下表直接取array中对应的下标，浮点型需要转换成对应的数字类型，如果转换失败则当做其他数据结构处理，其他数据类型需要转换成hash值，从node链表中索取。同时考虑了碰撞。
+t= {}
+t[1.2]=1
+t[1.3]=2
+t[1.0]=3
+t[1]  =4
+
+t[1.0] 与 t[1] 都在array中，t[1.2]与t[1.2]则在node*中以hash值的形式存储
+
+
+
+==========================================================================================
+1: 非  continuation or no yieldable 函数
+
+int docall (lua_State *L, int narg, int nres) 函数调用流程  narg:参数个数  nres:返回值个数。docall: 将堆栈由[1]调整为[3]
+|
+—— int lua_pcallk (lua_State *L, int nargs, int nresults, int errfunc ...)  
+   |
+   —— luaD_pcall (lua_State *L, Pfunc func, void *u,ptrdiff_t old_top, ptrdiff_t ef)  func：f_call函数, void:调用信息 old_top:被调用函数的栈绝度位置 ef:错误处理函数
+      |
+      -- luaD_rawrunprotected (lua_State *L, Pfunc f, void *ud)  f: f_call函数 ud: 调用信息。设置异常恢复地址。
+         |
+         -- void f_call (lua_State *L, void *ud) ud: 上面传入的调用信息
+            |
+            -- void luaD_call (lua_State *L, StkId func, int nResults, int allowyield) func：实际需要被调用的函数  nResults：结果个数 allowyield：0
+               |
+               -- int luaD_precall (lua_State *L, StkId func, int nresults) 如果是c函数或者c闭包，则直接被调用，否则经过对缺省参数的补充后交由lua虚拟机调用(详见 3:)
+                  |
+                  -- luaD_poscall 
+
+
+//关于lua函数调用
+2： 如何实现保护性调用（异常恢复）
+
+int luaD_rawrunprotected (lua_State *L, Pfunc f, void *ud) {
+  unsigned short oldnCcalls = L->nCcalls;
+  struct lua_longjmp lj;
+  lj.status = LUA_OK;
+  lj.previous = L->errorJmp;  /* chain new error handler */
+  L->errorJmp = &lj; 
+  LUAI_TRY(L, &lj,
+    (*f)(L, ud); //如果是c++编译器，直接调用try catch, 否则走ljmp流程,也就是说当f函数调用出异常会回到这里继续玩下走
+  );
+  L->errorJmp = lj.previous;  /* restore old error handler */  //如果调用出错将跳过f函数的执行继续向下走..
+  L->nCcalls = oldnCcalls;
+  return lj.status;
+} 
+
+其中LUAI_TRY函数对f函数进行了保护性调用,c++编译环境下使用try-catch机制捕获异常，c编译环境下则采用
+#define LUAI_THROW(L,c)   longjmp((c)->b, 1)
+#define LUAI_TRY(L,c,a)   if (setjmp((c)->b) == 0) { a }
+#define luai_jmpbuf   jmp_buf
+当在调用f内部抛出异常，则回到函数f调用前，函数继续向下走..
+
+
+3: lua函数调用堆栈调整
+
+| top |      |top |      |top |
+| errf|      |errf|      | p3 |
+|  p3 |----->|func|----->| p2 |
+|  p2 |      | p1 |      | p1 |
+|  p1 |      | p2 |      |func|
+| func|      | p3 |      |errf|
+  [1]          [2]         [3]
+
+见： LUA_API void lua_rotate (lua_State *L, int idx, int n) 
+
+
+3：函数调用堆栈调整 luaD_precall
+3.1： C closure和 C light func的调用堆栈变化
+当堆栈调整为2所示的结构之后，调用 void luaD_call (lua_State *L, StkId func, int nResults, int allowyield) 接口进行函数调用
+
+void luaD_call (lua_State *L, StkId func, int nResults, int allowyield) {
+  if (++L->nCcalls >= LUAI_MAXCCALLS) {
+    if (L->nCcalls == LUAI_MAXCCALLS)
+      luaG_runerror(L, "C stack overflow");
+    else if (L->nCcalls >= (LUAI_MAXCCALLS + (LUAI_MAXCCALLS>>3)))
+      luaD_throw(L, LUA_ERRERR);  /* error while handing stack error */ //先无视出现错误的情况！！
+  }
+  if (!allowyield) L->nny++;
+  if (!luaD_precall(L, func, nResults))  /* is a Lua function? */  //c closure和c函数会在luaD_precall直接执行，lua函数在luaV_execute中执行
+    luaV_execute(L);  /* call it */
+  if (!allowyield) L->nny--;
+  L->nCcalls--;
+}
+
+luaD_precall中对c closure和c light func直接进行调用
+
+---------------------------------------
+   case LUA_TCCL: {  /* C closure */
+     f = clCvalue(func)->f;
+    Cfunc:
+     luaC_checkGC(L);  /* stack grow uses memory */
+     luaD_checkstack(L, LUA_MINSTACK);  /* ensure minimum stack size */
+     ci = next_ci(L);  /* now 'enter' new function */
+     ci->nresults = nresults;               //返回值个数
+     ci->func = restorestack(L, funcr);     //被调用函数的绝对位置
+     ci->top = L->top + LUA_MINSTACK;       //创建新的 callinfo
+     lua_assert(ci->top <= L->stack_last);
+     ci->callstatus = 0;
+     if (L->hookmask & LUA_MASKCALL)
+       luaD_hook(L, LUA_HOOKCALL, -1);
+     lua_unlock(L);
+     n = (*f)(L);  /* do the actual call */ //直接调用，n为返回值
+     lua_lock(L);
+     api_checknelems(L, n);
+     luaD_poscall(L, L->top - n, n); //调用完成后的堆栈调整
+     return 1;
+   }
+---------------------------------------
+
+3.2：对lua函数， 
+
+case LUA_TLCL: {  /* Lua function: prepare its call */
+   StkId base;
+   Proto *p = clLvalue(func)->p;
+   n = cast_int(L->top - func) - 1;  /* number of real arguments */
+   luaC_checkGC(L);  /* stack grow uses memory */
+   luaD_checkstack(L, p->maxstacksize);
+   for (; n < p->numparams; n++) //如果函数定义的参数个数大于实际的参数个数，则用nil值补足 (可以看出来越靠后的参数越靠近栈顶部)
+     setnilvalue(L->top++);  /* complete missing arguments */
+   if (!p->is_vararg) {   //非缺省参数的函数 函数定义中不带 ...
+     func = restorestack(L, funcr);
+     base = func + 1;
+   }
+   else { //带缺省参数的函数，函数定义中带 ...
+     base = adjust_varargs(L, p, n);
+     func = restorestack(L, funcr);  /* previous call can change stack */
+   }
+   ci = next_ci(L);  /* now 'enter' new function */
+   ci->nresults = nresults;
+   ci->func = func;
+   ci->u.l.base = base; //参数起点？
+   ci->top = base + p->maxstacksize;
+   lua_assert(ci->top <= L->stack_last);
+   ci->u.l.savedpc = p->code;  /* starting point */
+   ci->callstatus = CIST_LUA;
+   L->top = ci->top;
+   if (L->hookmask & LUA_MASKCALL)
+     callhook(L, ci);
+   return 0;
+ }
+
+
+5: 函数调用后堆栈调整：luaD_poscall
+
+int luaD_poscall (lua_State *L, StkId firstResult, int nres) {
+   StkId res;
+   int wanted, i;
+   CallInfo *ci = L->ci;
+   if (L->hookmask & (LUA_MASKRET | LUA_MASKLINE)) {
+     if (L->hookmask & LUA_MASKRET) {
+       ptrdiff_t fr = savestack(L, firstResult);  /* hook may change stack */
+       luaD_hook(L, LUA_HOOKRET, -1);
+       firstResult = restorestack(L, fr);
+     }
+     L->oldpc = ci->previous->u.l.savedpc;  /* 'oldpc' for caller function */
+   }
+   res = ci->func;  /* res == final position of 1st result */
+   wanted = ci->nresults;
+   L->ci = ci->previous;  /* back to caller */
+   /* move results to correct place */
+   for (i = wanted; i != 0 && nres-- > 0; i--)
+     setobjs2s(L, res++, firstResult++);
+   while (i-- > 0)
+     setnilvalue(res++);
+   L->top = res;
+   return (wanted - LUA_MULTRET);  /* 0 iff wanted == LUA_MULTRET */
+}
+
+
+
+
+============================================================================
+//协程 
+1. 先看 coroutine.create的实现：lcorolib.c
+static int luaB_cocreate (lua_State *L) {
+  lua_State *NL;
+  luaL_checktype(L, 1, LUA_TFUNCTION);
+  NL = lua_newthread(L);   //新建一个线程
+  lua_pushvalue(L, 1);  /* move function to top */
+  lua_xmove(L, NL, 1);  /* move function from L to NL */  //将coroutine函数体挪到新的lua_State上
+  return 1;
+}  
+
+2: 再看resume操作
+static void resume (lua_State *L, void *ud) {
+	int nCcalls = L->nCcalls;
+	int n = *(cast(int*, ud));  /* number of arguments */
+	StkId firstArg = L->top - n;  /* first argument */
+	CallInfo *ci = L->ci;
+	if (nCcalls >= LUAI_MAXCCALLS)
+		resume_error(L, "C stack overflow", firstArg);
+	if (L->status == LUA_OK) {  /* may be starting a coroutine */   //第一次resume
+		if (ci != &L->base_ci)  /* not in base level? */ //调用栈必须是干净的
+			resume_error(L, "cannot resume non-suspended coroutine", firstArg);
+		/* coroutine is in base level; start running it */
+		if (!luaD_precall(L, firstArg - 1, LUA_MULTRET))  /* Lua function? */  //第一次resume相当于没有唤醒任何的yield，只是单纯使程序开始执行
+			luaV_execute(L);  /* call it */
+	}
+	else if (L->status != LUA_YIELD)  //否则中间必须是因为产生过一次yield导致线程被挂起
+		resume_error(L, "cannot resume dead coroutine", firstArg);
+	else {  /* resuming from previous yield */
+		L->status = LUA_OK;  /* mark that it is running (again) */
+		ci->func = restorestack(L, ci->extra);
+		if (isLua(ci))  /* yielded inside a hook? */    //如果是 lua内部的yield函数，则直接执行之（lua内部直接执行的是lua_yieldk(xx,xx, 0 , NULL)）
+			luaV_execute(L);  /* just continue running Lua code */
+		else {  /* 'common' yield */  // 如果是c闭包，则调用其保存的k函数
+			if (ci->u.c.k != NULL) {  /* does it have a continuation function? */  
+				lua_unlock(L);
+				n = (*ci->u.c.k)(L, LUA_YIELD, ci->u.c.ctx); /* call continuation */  //关键在这，转而调用上一次保存的yield点！ 这个好像是需要从c中传入的，一般lua函数中的yield函数直接执行了
+				lua_lock(L);
+				api_checknelems(L, n);
+				firstArg = L->top - n;  /* yield results come from continuation */
+			}
+			luaD_poscall(L, firstArg, n);  /* finish 'luaD_precall' */
+		}
+		unroll(L, NULL);  /* run continuation */
+	}
+	lua_assert(nCcalls == L->nCcalls);
+}
+
+此时堆栈
+
+| top | 
+|  p3 | -- resume传入的参数
+|  p2 | 
+|  p1 | 
+  [0]  
+
+3: lua 内部的yield函数
+LUA_API int lua_yieldk (lua_State *L, int nresults, lua_KContext ctx,
+                        lua_KFunction k) {  //coroutine.yield是不会传入 k 的
+  CallInfo *ci = L->ci;
+  luai_userstateyield(L, nresults);
+  lua_lock(L);
+  api_checknelems(L, nresults);
+  if (L->nny > 0) {
+    if (L != G(L)->mainthread)
+      luaG_runerror(L, "attempt to yield across a C-call boundary");
+    else
+      luaG_runerror(L, "attempt to yield from outside a coroutine");
+  }
+  L->status = LUA_YIELD;
+  ci->extra = savestack(L, ci->func);  /* save current 'func' */
+  if (isLua(ci)) {  /* inside a hook? */
+    api_check(L, k == NULL, "hooks cannot continue after yielding");
+  }
+  else {
+    if ((ci->u.c.k = k) != NULL)  /* is there a continuation? */
+      ci->u.c.ctx = ctx;  /* save context */
+    ci->func = L->top - nresults - 1;  /* protect stack below results */
+    luaD_throw(L, LUA_YIELD);
+  }
+  lua_assert(ci->callstatus & CIST_HOOKED);  /* must be inside a hook */
+  lua_unlock(L);
+  return 0;  /* return to 'luaD_hook' */
+}
+
+
+4: 函数调用的流程总结 lua_pcall
+
+callinfo 带k为c函数并带有函数续点k，否则为lua函数
+
+ 1          2         3         4
+|-|k| ---> |-||----> |-|| ---->||k|  [一级函数没有设置断点续传，后续所有函数都不能够设置]
+
+当callinfo4由于resume返回或者发生异常被恢复的时候，会调用 4-k，同时开始回滚调用链
+
+static void unroll (lua_State *L, void *ud) {
+  if (ud != NULL)  /* error status? */
+    finishCcall(L, *(int *)ud);  /* finish 'lua_pcallk' callee */
+  while (L->ci != &L->base_ci) {  /* something in the stack */   //如果回滚还没结束
+    if (!isLua(L->ci))  /* C function? */
+      finishCcall(L, LUA_YIELD);  /* complete its execution */   //如果当前需要回滚的是c函数
+    else {  /* Lua function */
+      luaV_finishOp(L);  /* finish interrupted instruction */
+      luaV_execute(L);  /* execute down to higher C 'boundary' */
+    }
+  }
+}
+
+//对c函数回滚的效果
+static void finishCcall (lua_State *L, int status) {
+  CallInfo *ci = L->ci;
+  int n;
+  /* must have a continuation and must be able to call it */
+  lua_assert(ci->u.c.k != NULL && L->nny == 0);
+  /* error status can only happen in a protected call */
+  lua_assert((ci->callstatus & CIST_YPCALL) || status == LUA_YIELD);
+  if (ci->callstatus & CIST_YPCALL) {  /* was inside a pcall? */
+    ci->callstatus &= ~CIST_YPCALL;  /* finish 'lua_pcall' */
+    L->errfunc = ci->u.c.old_errfunc;
+  }
+  /* finish 'lua_callk'/'lua_pcall'; CIST_YPCALL and 'errfunc' already
+     handled */
+  adjustresults(L, ci->nresults);
+  /* call continuation function */
+  lua_unlock(L);
+  n = (*ci->u.c.k)(L, status, ci->u.c.ctx);  //重新执行断点函数
+  lua_lock(L);
+  api_checknelems(L, n);
+  /* finish 'luaD_precall' */
+  luaD_poscall(L, L->top - n, n);
+}
+
+如果是lua函数，则重新解析被中断的指令交给虚拟机继续进行。
+
+
+
+==============================================================================
+Lua词法解析流程
+1: 从 cl = luaY_parser(L, p->z, &p->buff, &p->dyd, p->name, c); （ldo.c开始）
+2: luaY_parser 开始解析 
+LClosure *luaY_parser (lua_State *L, ZIO *z, Mbuffer *buff,
+                       Dyndata *dyd, const char *name, int firstchar) {
+  LexState lexstate;     //创建词法分析器，每一个文件（chunk都会创建一个lexstate）
+  FuncState funcstate;   //创建funstate结构，用于记录函数parse的时候的函数状态！
+  LClosure *cl = luaF_newLclosure(L, 1);  /* create main closure */  //为整个函数块创建一个closure
+  setclLvalue(L, L->top, cl);  /* anchor it (to avoid being collected) */                         
+  incr_top(L);
+  lexstate.h = luaH_new(L);  /* create table for scanner */
+  sethvalue(L, L->top, lexstate.h);  /* anchor it */
+  incr_top(L);
+  funcstate.f = cl->p = luaF_newproto(L);
+  funcstate.f->source = luaS_new(L, name);  /* create and anchor TString */
+  lua_assert(iswhite(funcstate.f));  /* do not need barrier here */
+  lexstate.buff = buff; 
+  lexstate.dyd = dyd;
+  dyd->actvar.n = dyd->gt.n = dyd->label.n = 0;
+  luaX_setinput(L, &lexstate, z, funcstate.f->source, firstchar);
+  mainfunc(&lexstate, &funcstate);   //开始解析！
+  lua_assert(!funcstate.prev && funcstate.nups == 1 && !lexstate.fs);
+  /* all scopes should be correctly finished */ 
+  lua_assert(dyd->actvar.n == 0 && dyd->gt.n == 0 && dyd->label.n == 0);
+  L->top--;  /* remove scanner's table */
+  return cl;  /* closure is on the stack, too */
+}
+
+3: 解析
+static void mainfunc (LexState *ls, FuncState *fs) {
+  BlockCnt bl;  //进入新的函数块都会创建一个BlockCnt结构
+  expdesc v;
+  open_func(ls, fs, &bl);   //进入最外层函数体,BlockCnt入栈
+  fs->f->is_vararg = 1;  /* main function is always vararg */
+  init_exp(&v, VLOCAL, 0);  /* create and... */
+  newupvalue(fs, ls->envn, &v);  /* ...set environment upvalue */
+  luaX_next(ls);  /* read first token */   //读取第一个token
+  statlist(ls);  /* parse main body */     //开始循环解析token，直至操作代码
+  check(ls, TK_EOS);
+  close_func(ls);  //将BlockCnt出栈
+} 
+  
+4: statlist --> statement
+static void statement (LexState *ls) 解析内容，对各种声明以及表达式的解析！解析信息保存在Proto中，解析的过程就是返回一个树形的Proto结构，每个Proto中都保存有各自的opcode，局部变量，upvalue，全局变量等信息，等到lvm运行的时候使用。
+
+
+几个比较重要的结构体：
+
+ 1： FuncState，函数状态保存期，全局的，主要用于在解析过程中全局控制
+/* state needed to generate code for a given function */
+typedef struct FuncState {
+  Proto *f;  /* current function header */    //当前指向的函数体实体proto
+  struct FuncState *prev;  /* enclosing function */ //funcstate队列，每进入一个新的函数都会创建一个funcstate串在这个链上
+  struct LexState *ls;  /* lexical state */      // 词法解析器 lex
+  struct BlockCnt *bl;  /* chain of current blocks */  //块控制器，每进入一个独立作用域的代码块都会创建一个 BlockCnt
+  int pc;  /* next position to code (equivalent to 'ncode') */  //指向当前proto最后一个操作码，用于追加
+  int lasttarget;   /* 'label' of last 'jump label' */
+  int jpc;  /* list of pending jumps to 'pc' */
+  int nk;  /* number of elements in 'k' */
+  int np;  /* number of elements in 'p' */
+  int firstlocal;  /* index of first local var (in Dyndata array) */
+  short nlocvars;  /* number of elements in 'f->locvars' */
+  lu_byte nactvar;  /* number of active local variables */
+  lu_byte nups;  /* number of upvalues */
+  lu_byte freereg;  /* first free register */  //寄存器空闲索引
+} FuncState;
+
+
+2:词法解析器
+typedef struct LexState {
+  int current;  /* current character (charint) */
+  int linenumber;  /* input line counter */
+  int lastline;  /* line of last token 'consumed' */
+  Token t;  /* current token */  //当前正在解析的token
+  Token lookahead;  /* look ahead token */
+  struct FuncState *fs;  /* current function (parser) */ //指向当前函数体的funstate
+  struct lua_State *L;     //指向当前线程
+  ZIO *z;  /* input stream */
+  Mbuffer *buff;  /* buffer for tokens */
+  Table *h;  /* to avoid collection/reuse strings */
+  struct Dyndata *dyd;  /* dynamic structures used by the parser */  //保存lable，跳转，局部变量相关
+  TString *source;  /* current source name */
+  TString *envn;  /* environment variable name */
+  char decpoint;  /* locale decimal point */
+} LexState;
+
+3: 当前代码块信息
+typedef struct BlockCnt {
+  struct BlockCnt *previous;  /* chain */
+  int firstlabel;  /* index of first label in this block */
+  int firstgoto;  /* index of first pending goto in this block */
+  lu_byte nactvar;  /* # active locals outside the block */
+  lu_byte upval;  /* true if some variable in the block is an upvalue */
+  lu_byte isloop;  /* true if 'block' is a loop */
+} BlockCnt;
+
+
+4: Proto:函数原型
+typedef struct Proto {
+  CommonHeader; 
+  lu_byte numparams;  /* number of fixed parameters */
+  lu_byte is_vararg;
+  lu_byte maxstacksize;  /* number of registers needed by this function */
+  int sizeupvalues;  /* size of 'upvalues' */
+  int sizek;  /* size of 'k' */
+  int sizecode;
+  int sizelineinfo;
+  int sizep;  /* size of 'p' */
+  int sizelocvars;
+  int linedefined;
+  int lastlinedefined;
+  TValue *k;  /* constants used by the function */ //所有使用的常量列表
+  Instruction *code;  /* opcodes */    //这个proto经过编译之后的操作码
+  struct Proto **p;  /* functions defined inside the function */  //内嵌proto
+  int *lineinfo;  /* map from opcodes to source lines (debug information) */
+  LocVar *locvars;  /* information about local variables (debug information) */  //局部变量
+  Upvaldesc *upvalues;  /* upvalue information */  //上值
+  struct LClosure *cache;  /* last-created closure with this prototype */
+  TString  *source;  /* used for debug information */
+  GCObject *gclist;
+} Proto;
+
+
+Lua虚拟机是指令运行是基于寄存器的，寄存器分配在Lua栈上，操作集合在opcode中，而操作数可以是const值，upvalue或者局部或者全局变量等，这些都是通过特定的方式获取！
+
+adjust_varargs 这个函数在运行时对lua堆栈进行了预备调整，这时候func和params都已经被压入到数据栈中，剩下的就是把base指向当前的top，接下来的数据栈就交给lvm作为寄存器使用？应该是这样的！！
+
+相关链接：http://blog.csdn.net/yuanlin2008/article/details/8486463
+
+闭包和闭包函数的实现
+在虚拟机运行的过程中，调用 luaF_findupval 查找当前堆栈上的upvalue，如果找到了就返回现成的，没有的话就构造一个。
+Proto相当于一个没有绑定upvalue的函数。
+
+
+
+
+==================================================================================
+Lua GC相关：
+云风的博客：http://blog.codingnow.com/2011/03/lua_gc_1.html
+http://blog.csdn.net/yuanlin2008/article/details/8684869
+
+
+
+
+
+
+
+
